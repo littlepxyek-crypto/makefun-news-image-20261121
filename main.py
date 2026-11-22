@@ -83,26 +83,30 @@ def output_folder() -> Path:
     return folder
 
 
-def deliver() -> Path:
-    """Validate the poster beside this program and copy it to the output."""
+def deliver() -> tuple[Path, int, int]:
+    """Validate the poster beside this program and copy it to the output.
+
+    Returns the written path and the poster's (width, height).
+    """
     poster_path = Path(__file__).resolve().parent / POSTER_NAME
     data = poster_path.read_bytes()
-    validate_poster(data)
+    width, height = validate_poster(data)
     target = output_folder() / ENTRY_NAME
     target.write_bytes(data)
     if target.read_bytes() != data:
         raise ValueError("the written entry.png differs from poster.png")
-    return target
+    return target, width, height
 
 
 def main() -> int:
     try:
-        target = deliver()
+        target, width, height = deliver()
     except (OSError, ValueError) as problem:
         print(f"failed: {problem}", file=sys.stderr)
         return 1
     data = target.read_bytes()
     print(f"wrote {target}")
+    print(f"image: {width}x{height} pixels")
     print(f"size: {len(data)} bytes")
     print(f"sha256: {hashlib.sha256(data).hexdigest()}")
     return 0
