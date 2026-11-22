@@ -1,94 +1,110 @@
 #!/usr/bin/env python3
-"""Copy the finished news poster into the bounty output folder.
+"""Deliver the finished news poster as this entry's output image.
 
-The poster itself is prepared beforehand as ``poster.png`` next to this
-file.  This program does not draw anything: it only checks that the
-poster is a genuine PNG of an allowed size, copies it byte for byte to
-``entry.png`` in the output folder, and then reads the copy back to
-prove the two files match exactly.
+The artwork is prepared ahead of time and stored beside this program as
+``poster.png``.  Running the program validates that the poster is a
+whole, well-formed PNG inside the bounty limits, then copies it byte
+for byte to ``entry.png`` in the output folder and reads the copy back
+to prove the bytes survived the trip unchanged.
+
+Only the Python standard library is used, and nothing here touches the
+network, so two runs always produce exactly the same output bytes.
 """
 
 import hashlib
 import os
+import struct
 import sys
+import zlib
 from pathlib import Path
 
-# The eight bytes every PNG file starts with.
-PNG_MARK = b"\x89PNG\r\n\x1a\n"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_FILE_BYTES = 1024 * 1024  # bounty cap: 1 MiB
+MAX_SIDE_PIXELS = 1024        # bounty cap: 1024 x 1024
 
-# Bounty limits for the submitted image.
-MAX_BYTES = 1024 * 1024
-MAX_SIDE = 1024
-
-SOURCE_NAME = "poster.png"
-TARGET_NAME = "entry.png"
-DEFAULT_OUTPUT = "/output"
+POSTER_NAME = "poster.png"
+ENTRY_NAME = "entry.png"
+FALLBACK_OUTPUT_DIR = "/output"
 
 
-def poster_next_to_program() -> Path:
-    """Return the path of the poster sitting beside this program."""
-    here = Path(__file__).resolve().parent
-    return here / SOURCE_NAME
+def iter_chunks(data: bytes):
+    """Yield (kind, payload) for each PNG chunk after the signature.
 
-
-def read_header_size(png_bytes: bytes) -> tuple[int, int]:
-    """Pull the pixel width and height out of a PNG header.
-
-    Layout of the first bytes of a PNG: 8 signature bytes, then a
-    4-byte chunk length, then the 4 letters ``IHDR``, then the width
-    (4 bytes, big-endian) and the height (4 bytes, big-endian).
+    A chunk is a 4-byte length, a 4-byte kind, ``length`` payload bytes
+    and a 4-byte CRC.  The CRC is checked here so a truncated or corrupt
+    poster is refused instead of delivered.
     """
-    if len(png_bytes) < 24:
-        raise ValueError("file is too short to hold a PNG header")
-    width = int.from_bytes(png_bytes[16:20], "big")
-    height = int.from_bytes(png_bytes[20:24], "big")
-    return width, height
+    pos = len(PNG_SIGNATURE)
+    while pos < len(data):
+        if pos + 8 > len(data):
+            raise ValueError("chunk header runs past the end of the file")
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        kind = data[pos + 4:pos + 8]
+        end = pos + 8 + length
+        if end + 4 > len(data):
+            raise ValueError(f"chunk {kind!r} runs past the end of the file")
+        payload = data[pos + 8:end]
+        (stored_crc,) = struct.unpack(">I", data[end:end + 4])
+        if zlib.crc32(kind + payload) & 0xFFFFFFFF != stored_crc:
+            raise ValueError(f"chunk {kind!r} has a bad checksum")
+        yield kind, payload
+        pos = end + 4
 
 
-def check_poster(png_bytes: bytes) -> tuple[int, int]:
-    """Refuse anything that is not a small, valid PNG poster."""
-    if not png_bytes.startswith(PNG_MARK):
-        raise ValueError("poster.png does not start with the PNG signature")
-    width, height = read_header_size(png_bytes)
-    if len(png_bytes) > MAX_BYTES:
-        raise ValueError(
-            f"poster is {len(png_bytes)} bytes, over the {MAX_BYTES} byte limit"
-        )
-    if width > MAX_SIDE or height > MAX_SIDE:
-        raise ValueError(
-            f"poster is {width}x{height}, over the {MAX_SIDE}x{MAX_SIDE} limit"
-        )
+def validate_poster(data: bytes) -> tuple[int, int]:
+    """Check the poster against every bounty rule; return (width, height)."""
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError(f"poster is {len(data)} bytes; the limit is {MAX_FILE_BYTES}")
+    if not data.startswith(PNG_SIGNATURE):
+        raise ValueError("poster does not start with the PNG signature")
+    kinds = []
+    width = height = 0
+    for kind, payload in iter_chunks(data):
+        kinds.append(kind)
+        if kind == b"IHDR":
+            width, height = struct.unpack(">II", payload[:8])
+    if not kinds or kinds[0] != b"IHDR":
+        raise ValueError("the first chunk is not the IHDR header")
+    if kinds[-1] != b"IEND":
+        raise ValueError("the last chunk is not IEND; the PNG is incomplete")
     if width == 0 or height == 0:
-        raise ValueError("poster has a zero width or height")
+        raise ValueError("poster reports a zero width or height")
+    if width > MAX_SIDE_PIXELS or height > MAX_SIDE_PIXELS:
+        raise ValueError(
+            f"poster is {width}x{height}; the limit is {MAX_SIDE_PIXELS}x{MAX_SIDE_PIXELS}"
+        )
     return width, height
 
 
-def choose_output_folder() -> Path:
-    """Use MAKEFUN_OUTPUT_DIR when set, otherwise the default folder."""
-    chosen = os.environ.get("MAKEFUN_OUTPUT_DIR") or DEFAULT_OUTPUT
-    folder = Path(chosen)
+def output_folder() -> Path:
+    """MAKEFUN_OUTPUT_DIR wins; otherwise the bounty default /output."""
+    folder = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or FALLBACK_OUTPUT_DIR)
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
 
+def deliver() -> Path:
+    """Validate the poster beside this program and copy it to the output."""
+    poster_path = Path(__file__).resolve().parent / POSTER_NAME
+    data = poster_path.read_bytes()
+    validate_poster(data)
+    target = output_folder() / ENTRY_NAME
+    target.write_bytes(data)
+    if target.read_bytes() != data:
+        raise ValueError("the written entry.png differs from poster.png")
+    return target
+
+
 def main() -> int:
     try:
-        source = poster_next_to_program()
-        png_bytes = source.read_bytes()
-        width, height = check_poster(png_bytes)
-        folder = choose_output_folder()
-        target = folder / TARGET_NAME
-        target.write_bytes(png_bytes)
-        written_back = target.read_bytes()
-        if written_back != png_bytes:
-            raise ValueError("written entry.png does not match poster.png")
+        target = deliver()
     except (OSError, ValueError) as problem:
         print(f"failed: {problem}", file=sys.stderr)
         return 1
-    digest = hashlib.sha256(written_back).hexdigest()
+    data = target.read_bytes()
     print(f"wrote {target}")
-    print(f"size: {len(written_back)} bytes")
-    print(f"sha256: {digest}")
+    print(f"size: {len(data)} bytes")
+    print(f"sha256: {hashlib.sha256(data).hexdigest()}")
     return 0
 
 
